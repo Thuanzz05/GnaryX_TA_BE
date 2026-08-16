@@ -302,6 +302,276 @@ app.get('/api/dashboard', async (req, res) => {
   }
 });
 
+// Middleware to extract user from token
+async function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = await findUserByEmail(payload.email);
+    if (!user) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    req.userId = user.id;
+    req.userEmail = user.email;
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+}
+
+// User Profile Endpoints
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [req.params.id]);
+    if (!rows[0]) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json(normalizeUser(rows[0]));
+  } catch (error) {
+    res.status(500).json({ message: 'DB error', error: error.message });
+  }
+});
+
+app.put('/api/users/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.userId !== req.params.id) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    const { fullName, level, dailyGoal, preferredTopics } = req.body || {};
+    const updates = [];
+    const values = [];
+
+    if (fullName) {
+      updates.push('full_name = ?');
+      values.push(String(fullName).trim());
+    }
+    if (level) {
+      updates.push('level = ?');
+      values.push(level);
+    }
+    if (dailyGoal) {
+      updates.push('daily_goal = ?');
+      values.push(Number(dailyGoal));
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    values.push(req.params.id);
+    const sql = `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`;
+    await pool.query(sql, values);
+
+    const [rows] = await pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [req.params.id]);
+    res.json(normalizeUser(rows[0]));
+  } catch (error) {
+    res.status(500).json({ message: 'Update failed', error: error.message });
+  }
+});
+
+// Word Progress Endpoints
+app.post('/api/vocabulary/:wordId/favorite', authenticateToken, async (req, res) => {
+  try {
+    const { wordId } = req.params;
+    const { isFavorite } = req.body || {};
+
+    if (typeof isFavorite !== 'boolean') {
+      return res.status(400).json({ message: 'isFavorite must be boolean' });
+    }
+
+    const [existing] = await pool.query(
+      'SELECT * FROM user_word_progress WHERE user_id = ? AND word_id = ? LIMIT 1',
+      [req.userId, wordId],
+    );
+
+    if (existing[0]) {
+      await pool.query(
+        'UPDATE user_word_progress SET is_favorite = ?, updated_at = NOW() WHERE user_id = ? AND word_id = ?',
+        [isFavorite ? 1 : 0, req.userId, wordId],
+      );
+    } else {
+      await pool.query(
+        'INSERT INTO user_word_progress (user_id, word_id, is_favorite) VALUES (?, ?, ?)',
+        [req.userId, wordId, isFavorite ? 1 : 0],
+      );
+    }
+
+    res.json({ success: true, isFavorite });
+  } catch (error) {
+    res.status(500).json({ message: 'Update failed', error: error.message });
+  }
+});
+
+app.post('/api/vocabulary/:wordId/learned', authenticateToken, async (req, res) => {
+  try {
+    const { wordId } = req.params;
+    const { isLearned } = req.body || {};
+
+    if (typeof isLearned !== 'boolean') {
+      return res.status(400).json({ message: 'isLearned must be boolean' });
+    }
+
+    const [existing] = await pool.query(
+      'SELECT * FROM user_word_progress WHERE user_id = ? AND word_id = ? LIMIT 1',
+      [req.userId, wordId],
+    );
+
+    if (existing[0]) {
+      await pool.query(
+        'UPDATE user_word_progress SET is_learned = ?, updated_at = NOW() WHERE user_id = ? AND word_id = ?',
+        [isLearned ? 1 : 0, req.userId, wordId],
+      );
+    } else {
+      await pool.query(
+        'INSERT INTO user_word_progress (user_id, word_id, is_learned) VALUES (?, ?, ?)',
+        [req.userId, wordId, isLearned ? 1 : 0],
+      );
+    }
+
+    res.json({ success: true, isLearned });
+  } catch (error) {
+    res.status(500).json({ message: 'Update failed', error: error.message });
+  }
+});
+
+// Quiz Endpoints
+app.get('/api/quizzes', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM quizzes WHERE deleted_at IS NULL ORDER BY created_at DESC');
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ message: 'DB error', error: error.message });
+  }
+});
+
+app.get('/api/quizzes/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM quizzes WHERE id = ? AND deleted_at IS NULL LIMIT 1', [req.params.id]);
+    if (!rows[0]) {
+      return res.status(404).json({ message: 'Quiz not found' });
+    }
+    res.json(rows[0]);
+  } catch (error) {
+    res.status(500).json({ message: 'DB error', error: error.message });
+  }
+});
+
+app.post('/api/quizzes/:id/submit', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { answers, timeSpent } = req.body || {};
+
+    if (!Array.isArray(answers)) {
+      return res.status(400).json({ message: 'answers must be an array' });
+    }
+
+    const attemptId = `qa-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    let correctCount = 0;
+    const results = [];
+
+    for (const answer of answers) {
+      const { questionId, selectedAnswer } = answer;
+      const [question] = await pool.query('SELECT * FROM quiz_questions WHERE id = ? LIMIT 1', [questionId]);
+
+      if (question[0]) {
+        const isCorrect = selectedAnswer === question[0].correct_answer;
+        if (isCorrect) correctCount++;
+        results.push({
+          questionId,
+          selectedAnswer,
+          correctAnswer: question[0].correct_answer,
+          isCorrect,
+        });
+      }
+    }
+
+    const score = Math.round((correctCount / answers.length) * 100);
+    const xpEarned = Math.max(10, Math.round(score / 10));
+
+    // Store quiz attempt
+    try {
+      await pool.query(
+        'INSERT INTO quiz_attempts (id, user_id, quiz_id, score, time_spent_seconds, correct_answers, total_questions) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [attemptId, req.userId, id, score, timeSpent || 0, correctCount, answers.length],
+      );
+
+      // Update user XP
+      await pool.query('UPDATE users SET xp = xp + ? WHERE id = ?', [xpEarned, req.userId]);
+    } catch (dbError) {
+      // If DB fails, still return results
+      console.log('DB quiz save failed:', dbError.message);
+    }
+
+    res.json({
+      score,
+      correctCount,
+      totalQuestions: answers.length,
+      xpEarned,
+      results,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Quiz submission failed', error: error.message });
+  }
+});
+
+// Progress Endpoints
+app.get('/api/users/:userId/progress', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const [wordData] = await pool.query(
+      'SELECT COUNT(*) as count FROM user_word_progress WHERE user_id = ? AND is_learned = 1',
+      [userId],
+    );
+    const [quizData] = await pool.query(
+      'SELECT COUNT(*) as count, AVG(score) as avgScore FROM quiz_attempts WHERE user_id = ?',
+      [userId],
+    );
+
+    res.json({
+      totalWordsLearned: wordData[0]?.count || 0,
+      totalQuizzes: quizData[0]?.count || 0,
+      averageQuizScore: Math.round(quizData[0]?.avgScore || 0),
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'DB error', error: error.message });
+  }
+});
+
+// Learning Activity Endpoints
+app.post('/api/learning-activities', authenticateToken, async (req, res) => {
+  try {
+    const { type, description, xpEarned } = req.body || {};
+
+    if (!type || !description) {
+      return res.status(400).json({ message: 'type and description are required' });
+    }
+
+    const activityId = `la-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    await pool.query(
+      'INSERT INTO learning_activities (id, user_id, type, description, xp_earned) VALUES (?, ?, ?, ?, ?)',
+      [activityId, req.userId, type, description, xpEarned || 0],
+    );
+
+    res.status(201).json({ id: activityId, success: true });
+  } catch (error) {
+    res.status(500).json({ message: 'Activity creation failed', error: error.message });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(500).json({ message: 'Internal server error', error: err.message });
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
