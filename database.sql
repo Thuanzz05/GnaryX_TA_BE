@@ -271,7 +271,7 @@ SET FOREIGN_KEY_CHECKS = 1;
 -- 2. THÊM USERS & TOPICS
 -- ==========================================
 INSERT INTO users (id, full_name, email, password_hash, auth_provider, level, xp, streak, daily_goal) VALUES 
-('u1000000-0000-0000-0000-000000000001', 'Duy Thuấn', 'thuan@example.com', '$2b$10$hashedpasswordhere123456789', 'local', 'B1', 1250, 7, 20),
+('u1000000-0000-0000-0000-000000000001', 'Duy Thuấn', 'thuan@example.com', '$2b$10$Atg4B785eqXXtkdTzjnm9OAzDvwpgbbinjiIjjOIWdIxlNfucMP7q', 'local', 'B1', 1250, 7, 20),
 ('u2000000-0000-0000-0000-000000000002', 'Google User', 'google@example.com', NULL, 'google', 'A2', 400, 2, 15);
 
 INSERT INTO user_topics (user_id, topic_name) VALUES 
