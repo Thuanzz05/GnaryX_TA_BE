@@ -29,6 +29,88 @@ const parseJsonField = (value) => {
   return [];
 };
 
+// Recompute a user's daily streak based on their last login date.
+// Call this BEFORE updating last_login_at.
+async function updateLoginStreak(userId) {
+  const [rows] = await pool.query('SELECT streak, last_login_at FROM users WHERE id = ?', [userId]);
+  if (rows.length === 0) return 0;
+
+  const { streak, last_login_at } = rows[0];
+  let newStreak = streak || 0;
+
+  if (!last_login_at) {
+    newStreak = 1;
+  } else {
+    const last = new Date(last_login_at);
+    const now = new Date();
+    const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const diffDays = Math.round((startOfDay(now) - startOfDay(last)) / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) {
+      newStreak = streak || 1; // already logged in today, keep streak
+    } else if (diffDays === 1) {
+      newStreak = (streak || 0) + 1; // consecutive day
+    } else {
+      newStreak = 1; // streak broken
+    }
+  }
+
+  await pool.query('UPDATE users SET streak = ? WHERE id = ?', [newStreak, userId]);
+  return newStreak;
+}
+
+// Achievement definitions matched by title. Checks current user stats and
+// unlocks + logs any achievement not already owned whose criteria is met.
+async function checkAndUnlockAchievements(userId) {
+  const [[user]] = await pool.query(
+    'SELECT xp, streak FROM users WHERE id = ?',
+    [userId],
+  );
+  if (!user) return [];
+
+  const [[{ lessonsCompleted }]] = await pool.query(
+    `SELECT COUNT(*) as lessonsCompleted FROM user_lesson_progress WHERE user_id = ? AND status = 'completed'`,
+    [userId],
+  );
+  const [[{ wordsLearned }]] = await pool.query(
+    'SELECT COUNT(*) as wordsLearned FROM user_word_progress WHERE user_id = ? AND is_learned = 1',
+    [userId],
+  );
+  const [[{ quizzesTaken }]] = await pool.query(
+    'SELECT COUNT(*) as quizzesTaken FROM quiz_attempts WHERE user_id = ?',
+    [userId],
+  );
+
+  const criteria = {
+    'First Blood': lessonsCompleted >= 1,
+    'Streak Master': (user.streak || 0) >= 7,
+    'Word Scholar': wordsLearned >= 100,
+  };
+
+  const [achievements] = await pool.query('SELECT * FROM achievements');
+  const [owned] = await pool.query('SELECT achievement_id FROM user_achievements WHERE user_id = ?', [userId]);
+  const ownedIds = new Set(owned.map((o) => o.achievement_id));
+
+  const unlocked = [];
+  for (const achievement of achievements) {
+    if (ownedIds.has(achievement.id)) continue;
+    const isMet = criteria[achievement.title];
+    if (!isMet) continue;
+
+    await pool.query('INSERT INTO user_achievements (user_id, achievement_id) VALUES (?, ?)', [userId, achievement.id]);
+    if (achievement.xp_reward) {
+      await pool.query('UPDATE users SET xp = xp + ? WHERE id = ?', [achievement.xp_reward, userId]);
+    }
+    await pool.query(
+      'INSERT INTO learning_activities (id, user_id, activity_type, description, xp_earned) VALUES (?, ?, ?, ?, ?)',
+      [uuidv4(), userId, 'achievement_unlocked', `Unlocked achievement: ${achievement.title}`, achievement.xp_reward || 0],
+    );
+    unlocked.push(achievement);
+  }
+
+  return unlocked;
+}
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -147,7 +229,11 @@ app.post('/api/auth/login', async (req, res) => {
       [uuidv4(), user.id, refreshToken],
     );
 
+    const newStreak = await updateLoginStreak(user.id);
     await pool.query('UPDATE users SET last_login_at = NOW() WHERE id = ?', [user.id]);
+    await checkAndUnlockAchievements(user.id);
+
+    const [topics] = await pool.query('SELECT topic_name FROM user_topics WHERE user_id = ?', [user.id]);
 
     res.json({
       accessToken,
@@ -161,11 +247,56 @@ app.post('/api/auth/login', async (req, res) => {
         avatar: user.avatar,
         xp: Number(user.xp || 0),
         levelNumber: Number(user.level_number || 1),
-        streak: Number(user.streak || 0),
+        streak: newStreak,
         dailyGoal: Number(user.daily_goal || 20),
-        preferredTopics: Array.isArray(user.preferredTopics) ? user.preferredTopics : [],
+        preferredTopics: topics.map((t) => t.topic_name),
       },
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get currently authenticated user (used by frontend to restore session)
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const [users] = await pool.query('SELECT * FROM users WHERE id = ?', [req.user.id]);
+    if (users.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    const [topics] = await pool.query('SELECT topic_name FROM user_topics WHERE user_id = ?', [req.user.id]);
+    const user = users[0];
+
+    res.json({
+      user: {
+        id: user.id,
+        fullName: user.full_name,
+        name: user.full_name,
+        email: user.email,
+        level: user.level,
+        avatar: user.avatar,
+        xp: Number(user.xp || 0),
+        levelNumber: Number(user.level_number || 1),
+        streak: Number(user.streak || 0),
+        dailyGoal: Number(user.daily_goal || 20),
+        preferredTopics: topics.map((t) => t.topic_name),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Logout - revoke refresh token
+app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    if (token) {
+      await pool.query('UPDATE user_refresh_tokens SET is_revoked = TRUE WHERE token = ?', [token]);
+    } else {
+      await pool.query('UPDATE user_refresh_tokens SET is_revoked = TRUE WHERE user_id = ?', [req.user.id]);
+    }
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -204,6 +335,41 @@ app.post('/api/auth/refresh-token', async (req, res) => {
 
 app.get('/api/vocabulary', authenticateToken, async (req, res) => {
   try {
+    const { search, level, topic, partOfSpeech, difficulty, learned, favorite } = req.query;
+
+    const conditions = ['v.deleted_at IS NULL'];
+    const params = [req.user.id];
+
+    if (search) {
+      conditions.push('(v.word LIKE ? OR v.meaning LIKE ? OR v.meaning_vi LIKE ?)');
+      const like = `%${search}%`;
+      params.push(like, like, like);
+    }
+    if (level) {
+      conditions.push('v.level = ?');
+      params.push(level);
+    }
+    if (topic) {
+      conditions.push('v.topic = ?');
+      params.push(topic);
+    }
+    if (partOfSpeech) {
+      conditions.push('v.part_of_speech = ?');
+      params.push(partOfSpeech);
+    }
+    if (difficulty) {
+      conditions.push('v.difficulty = ?');
+      params.push(difficulty);
+    }
+    if (learned === 'Learned') {
+      conditions.push('up.is_learned = 1');
+    } else if (learned === 'Not Learned') {
+      conditions.push('(up.is_learned IS NULL OR up.is_learned = 0)');
+    }
+    if (favorite === 'true') {
+      conditions.push('up.is_favorite = 1');
+    }
+
     const [words] = await pool.query(
       `
         SELECT v.*,
@@ -211,9 +377,10 @@ app.get('/api/vocabulary', authenticateToken, async (req, res) => {
                IF(up.is_learned = 1, true, false) as isLearned
         FROM vocabulary_words v
         LEFT JOIN user_word_progress up ON v.id = up.word_id AND up.user_id = ?
-        WHERE v.deleted_at IS NULL
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY v.word ASC
       `,
-      [req.user.id],
+      params,
     );
 
     const parsedWords = words.map((word) => ({
@@ -227,6 +394,59 @@ app.get('/api/vocabulary', authenticateToken, async (req, res) => {
     }));
 
     res.json(parsedWords);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single vocabulary word detail
+app.get('/api/vocabulary/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [words] = await pool.query(
+      `
+        SELECT v.*,
+               IF(up.is_favorite = 1, true, false) as isFavorite,
+               IF(up.is_learned = 1, true, false) as isLearned
+        FROM vocabulary_words v
+        LEFT JOIN user_word_progress up ON v.id = up.word_id AND up.user_id = ?
+        WHERE v.id = ? AND v.deleted_at IS NULL
+        LIMIT 1
+      `,
+      [req.user.id, id],
+    );
+
+    if (words.length === 0) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+
+    const word = words[0];
+    res.json({
+      ...word,
+      synonyms: parseJsonField(word.synonyms),
+      antonyms: parseJsonField(word.antonyms),
+      collocations: parseJsonField(word.collocations),
+      word_family: parseJsonField(word.word_family),
+      isFavorite: Boolean(word.isFavorite),
+      isLearned: Boolean(word.isLearned),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get distinct topics & levels for vocabulary filter dropdowns
+app.get('/api/vocabulary/meta/filters', authenticateToken, async (req, res) => {
+  try {
+    const [topics] = await pool.query(
+      'SELECT DISTINCT topic FROM vocabulary_words WHERE deleted_at IS NULL ORDER BY topic',
+    );
+    res.json({
+      topics: topics.map((t) => t.topic),
+      levels: ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'],
+      partsOfSpeech: ['noun', 'verb', 'adjective', 'adverb', 'preposition', 'conjunction', 'pronoun', 'interjection'],
+      difficulties: ['easy', 'medium', 'hard'],
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -417,6 +637,52 @@ app.post('/api/lessons/:lessonId/progress', authenticateToken, async (req, res) 
       );
     }
 
+    // Recompute parent course progress (% of lessons completed) and log activity
+    const [[lessonRow]] = await pool.query('SELECT course_id, title FROM lessons WHERE id = ?', [lessonId]);
+    if (lessonRow) {
+      const [[{ totalLessons }]] = await pool.query(
+        'SELECT COUNT(*) as totalLessons FROM lessons WHERE course_id = ? AND deleted_at IS NULL',
+        [lessonRow.course_id],
+      );
+      const [[{ completedLessons }]] = await pool.query(
+        `SELECT COUNT(*) as completedLessons
+         FROM user_lesson_progress ulp
+         JOIN lessons l ON ulp.lesson_id = l.id
+         WHERE ulp.user_id = ? AND l.course_id = ? AND ulp.status = 'completed'`,
+        [userId, lessonRow.course_id],
+      );
+
+      const courseProgress = totalLessons > 0 ? Math.round((completedLessons / totalLessons) * 100) : 0;
+      const courseStatus = courseProgress >= 100 ? 'completed' : courseProgress > 0 ? 'in-progress' : 'not-started';
+
+      const [existingCourseProgress] = await pool.query(
+        'SELECT 1 FROM user_course_progress WHERE user_id = ? AND course_id = ?',
+        [userId, lessonRow.course_id],
+      );
+      if (existingCourseProgress.length === 0) {
+        await pool.query(
+          'INSERT INTO user_course_progress (user_id, course_id, progress, status) VALUES (?, ?, ?, ?)',
+          [userId, lessonRow.course_id, courseProgress, courseStatus],
+        );
+      } else {
+        await pool.query(
+          'UPDATE user_course_progress SET progress = ?, status = ? WHERE user_id = ? AND course_id = ?',
+          [courseProgress, courseStatus, userId, lessonRow.course_id],
+        );
+      }
+
+      if (status === 'completed') {
+        const xpEarned = 100;
+        await pool.query('UPDATE users SET xp = xp + ? WHERE id = ?', [xpEarned, userId]);
+        await pool.query(
+          'INSERT INTO learning_activities (id, user_id, activity_type, description, xp_earned) VALUES (?, ?, ?, ?, ?)',
+          [uuidv4(), userId, 'lesson_completed', `Completed lesson: ${lessonRow.title}`, xpEarned],
+        );
+      }
+    }
+
+    await checkAndUnlockAchievements(userId);
+
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -479,11 +745,102 @@ app.get('/api/progress/dashboard', authenticateToken, async (req, res) => {
       [userId, userId],
     );
 
+    // Total distinct words learned by this user
+    const [[{ wordsLearned }]] = await pool.query(
+      'SELECT COUNT(*) as wordsLearned FROM user_word_progress WHERE user_id = ? AND is_learned = 1',
+      [userId],
+    );
+
+    // Words due for review today
+    const [[{ reviewDueToday }]] = await pool.query(
+      `SELECT COUNT(*) as reviewDueToday FROM user_word_progress
+       WHERE user_id = ? AND next_review_date IS NOT NULL AND next_review_date <= NOW()`,
+      [userId],
+    );
+
+    // Word of the Day: deterministic pick based on today's date so it's stable all day,
+    // preferring a word the user hasn't learned yet.
+    const daySeed = new Date().toISOString().slice(0, 10);
+    const [wordOfDayRows] = await pool.query(
+      `
+        SELECT v.*, IF(up.is_favorite = 1, true, false) as isFavorite, IF(up.is_learned = 1, true, false) as isLearned
+        FROM vocabulary_words v
+        LEFT JOIN user_word_progress up ON v.id = up.word_id AND up.user_id = ?
+        WHERE v.deleted_at IS NULL AND (up.is_learned IS NULL OR up.is_learned = 0)
+        ORDER BY MD5(CONCAT(v.id, ?)) LIMIT 1
+      `,
+      [userId, daySeed],
+    );
+    let wordOfTheDay = wordOfDayRows[0] || null;
+    if (!wordOfTheDay) {
+      const [fallback] = await pool.query(
+        `
+          SELECT v.*, IF(up.is_favorite = 1, true, false) as isFavorite, IF(up.is_learned = 1, true, false) as isLearned
+          FROM vocabulary_words v
+          LEFT JOIN user_word_progress up ON v.id = up.word_id AND up.user_id = ?
+          WHERE v.deleted_at IS NULL
+          ORDER BY MD5(CONCAT(v.id, ?)) LIMIT 1
+        `,
+        [userId, daySeed],
+      );
+      wordOfTheDay = fallback[0] || null;
+    }
+    if (wordOfTheDay) {
+      wordOfTheDay = {
+        ...wordOfTheDay,
+        synonyms: parseJsonField(wordOfTheDay.synonyms),
+        antonyms: parseJsonField(wordOfTheDay.antonyms),
+        collocations: parseJsonField(wordOfTheDay.collocations),
+        word_family: parseJsonField(wordOfTheDay.word_family),
+        isFavorite: Boolean(wordOfTheDay.isFavorite),
+        isLearned: Boolean(wordOfTheDay.isLearned),
+      };
+    }
+
+    // Today's learning plan: derive concrete checklist items from real data
+    const [inProgressQuizzes] = await pool.query(
+      `SELECT q.id, q.title FROM quizzes q
+       WHERE q.id NOT IN (SELECT quiz_id FROM quiz_attempts WHERE user_id = ?) LIMIT 1`,
+      [userId],
+    );
+    const learningPlan = [
+      {
+        id: 'learn-new-words',
+        title: 'Learn 10 new words',
+        description: 'Discover new vocabulary from your active course',
+        isCompleted: wordsLearned > 0 && wordsLearned % 10 === 0 ? true : false,
+        actionUrl: '/vocabulary',
+      },
+      {
+        id: 'review-words',
+        title: `Review ${reviewDueToday} words`,
+        description: 'Strengthen memory with spaced repetition',
+        isCompleted: reviewDueToday === 0,
+        actionUrl: '/review',
+      },
+      {
+        id: 'complete-quiz',
+        title: 'Complete a vocabulary quiz',
+        description: inProgressQuizzes[0] ? inProgressQuizzes[0].title : 'All quizzes completed',
+        isCompleted: inProgressQuizzes.length === 0,
+        actionUrl: '/quiz',
+      },
+      {
+        id: 'practice-difficult',
+        title: 'Practice difficult words',
+        description: 'Reinforce words you find hard to remember',
+        isCompleted: false,
+        actionUrl: '/practice',
+      },
+    ];
+
     res.json({
       user,
       activeCourses,
       recentActivity,
-      stats: stats[0] || {},
+      stats: { ...stats[0], wordsLearned, reviewDueToday },
+      wordOfTheDay,
+      learningPlan,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -775,12 +1132,21 @@ app.post('/api/quizzes/:quizId/submit', authenticateToken, async (req, res) => {
     // Update user XP
     await pool.query('UPDATE users SET xp = xp + ? WHERE id = ?', [xpEarned, userId]);
 
+    const [[quizRow]] = await pool.query('SELECT title FROM quizzes WHERE id = ?', [quizId]);
+    await pool.query(
+      'INSERT INTO learning_activities (id, user_id, activity_type, description, xp_earned) VALUES (?, ?, ?, ?, ?)',
+      [uuidv4(), userId, 'quiz_completed', `Scored ${score}% on ${quizRow ? quizRow.title : 'a quiz'}`, xpEarned],
+    );
+
+    const unlockedAchievements = await checkAndUnlockAchievements(userId);
+
     res.json({
       attemptId,
       score,
       correctAnswers,
       wrongAnswers,
       xpEarned,
+      unlockedAchievements,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -956,7 +1322,42 @@ app.post('/api/flashcards/:wordId/learn', authenticateToken, async (req, res) =>
       await pool.query('UPDATE user_word_progress SET is_learned = 1 WHERE user_id = ? AND word_id = ?', [userId, wordId]);
     }
 
-    res.json({ success: true });
+    const [[wordRow]] = await pool.query('SELECT word FROM vocabulary_words WHERE id = ?', [wordId]);
+    const xpEarned = 10;
+    await pool.query('UPDATE users SET xp = xp + ? WHERE id = ?', [xpEarned, userId]);
+    await pool.query(
+      'INSERT INTO learning_activities (id, user_id, activity_type, description, xp_earned) VALUES (?, ?, ?, ?, ?)',
+      [uuidv4(), userId, 'word_learned', `Learned new word: ${wordRow ? wordRow.word : ''}`, xpEarned],
+    );
+
+    const unlockedAchievements = await checkAndUnlockAchievements(userId);
+
+    res.json({ success: true, xpEarned, unlockedAchievements });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =========================
+// ACHIEVEMENTS ROUTES
+// =========================
+
+app.get('/api/achievements', authenticateToken, async (req, res) => {
+  try {
+    const [achievements] = await pool.query('SELECT * FROM achievements ORDER BY xp_reward ASC');
+    const [owned] = await pool.query(
+      'SELECT achievement_id, unlocked_at FROM user_achievements WHERE user_id = ?',
+      [req.user.id],
+    );
+    const ownedMap = new Map(owned.map((o) => [o.achievement_id, o.unlocked_at]));
+
+    res.json(
+      achievements.map((a) => ({
+        ...a,
+        isUnlocked: ownedMap.has(a.id),
+        unlockedAt: ownedMap.get(a.id) || null,
+      })),
+    );
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
