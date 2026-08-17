@@ -120,7 +120,9 @@ const authenticateToken = (req, res, next) => {
   }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
+    if (err) {
+      return res.status(401).json({ message: 'Token expired or invalid' });
+    }
     req.user = user;
     next();
   });
@@ -767,9 +769,9 @@ app.get('/api/progress/dashboard', authenticateToken, async (req, res) => {
         FROM vocabulary_words v
         LEFT JOIN user_word_progress up ON v.id = up.word_id AND up.user_id = ?
         WHERE v.deleted_at IS NULL AND (up.is_learned IS NULL OR up.is_learned = 0)
-        ORDER BY MD5(CONCAT(v.id, ?)) LIMIT 1
+        ORDER BY v.created_at, v.id LIMIT 1
       `,
-      [userId, daySeed],
+      [userId],
     );
     let wordOfTheDay = wordOfDayRows[0] || null;
     if (!wordOfTheDay) {
@@ -779,9 +781,9 @@ app.get('/api/progress/dashboard', authenticateToken, async (req, res) => {
           FROM vocabulary_words v
           LEFT JOIN user_word_progress up ON v.id = up.word_id AND up.user_id = ?
           WHERE v.deleted_at IS NULL
-          ORDER BY MD5(CONCAT(v.id, ?)) LIMIT 1
+          ORDER BY v.created_at, v.id LIMIT 1
         `,
-        [userId, daySeed],
+        [userId],
       );
       wordOfTheDay = fallback[0] || null;
     }
