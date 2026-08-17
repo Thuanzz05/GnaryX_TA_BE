@@ -868,6 +868,103 @@ app.get('/api/progress', authenticateToken, async (req, res) => {
   }
 });
 
+// Get historical analytics for the Progress page charts (words learned per
+// day over the last 7 days, CEFR level breakdown, and recent quiz scores).
+app.get('/api/progress/analytics', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Words marked as learned, grouped by the day they were marked (last 7 days).
+    // user_word_progress has no dedicated "learned_at" column, so updated_at on
+    // learned rows is the closest available signal.
+    const [wordsByDayRows] = await pool.query(
+      `
+        SELECT DATE(updated_at) as day, COUNT(*) as words
+        FROM user_word_progress
+        WHERE user_id = ? AND is_learned = 1 AND updated_at >= (CURDATE() - INTERVAL 6 DAY)
+        GROUP BY DATE(updated_at)
+      `,
+      [userId],
+    );
+    const wordsByDayMap = new Map(wordsByDayRows.map((r) => [new Date(r.day).toISOString().slice(0, 10), r.words]));
+    const wordsLearnedByDay = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      wordsLearnedByDay.push({
+        day: d.toLocaleDateString('en-US', { weekday: 'short' }),
+        date: key,
+        words: wordsByDayMap.get(key) || 0,
+      });
+    }
+
+    // CEFR breakdown: how many words the user has learned per level vs. total words in that level.
+    const [cefrRows] = await pool.query(
+      `
+        SELECT v.level,
+               COUNT(*) as total,
+               COALESCE(SUM(CASE WHEN up.is_learned = 1 THEN 1 ELSE 0 END), 0) as learned
+        FROM vocabulary_words v
+        LEFT JOIN user_word_progress up ON v.id = up.word_id AND up.user_id = ?
+        WHERE v.deleted_at IS NULL
+        GROUP BY v.level
+      `,
+      [userId],
+    );
+    const cefrMap = new Map(cefrRows.map((r) => [r.level, r]));
+    const cefrProgress = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].map((level) => {
+      const row = cefrMap.get(level);
+      const total = row ? Number(row.total) : 0;
+      const learned = row ? Number(row.learned) : 0;
+      return {
+        level,
+        learned,
+        total,
+        progress: total > 0 ? Math.round((learned / total) * 100) : 0,
+      };
+    });
+
+    // Recent quiz performance.
+    const [quizAttempts] = await pool.query(
+      `
+        SELECT q.title, qa.score, qa.correct_answers, qa.wrong_answers, qa.submitted_at
+        FROM quiz_attempts qa
+        JOIN quizzes q ON qa.quiz_id = q.id
+        WHERE qa.user_id = ?
+        ORDER BY qa.submitted_at ASC
+        LIMIT 10
+      `,
+      [userId],
+    );
+
+    // Overall totals used by the stat cards.
+    const [[{ totalWords }]] = await pool.query(
+      'SELECT COUNT(*) as totalWords FROM user_word_progress WHERE user_id = ? AND is_learned = 1',
+      [userId],
+    );
+    const [[{ quizzesTaken, avgScore }]] = await pool.query(
+      'SELECT COUNT(*) as quizzesTaken, COALESCE(AVG(score), 0) as avgScore FROM quiz_attempts WHERE user_id = ?',
+      [userId],
+    );
+    const [[{ streak }]] = await pool.query('SELECT streak FROM users WHERE id = ?', [userId]);
+
+    res.json({
+      wordsLearnedByDay,
+      cefrProgress,
+      quizPerformance: quizAttempts,
+      totals: {
+        totalWords: Number(totalWords || 0),
+        currentStreak: Number(streak || 0),
+        quizzesTaken: Number(quizzesTaken || 0),
+        avgQuizScore: Math.round(Number(avgScore || 0)),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // =========================
 // USER PROFILE ROUTES
 // =========================
@@ -948,8 +1045,8 @@ app.get('/api/users/settings', authenticateToken, async (req, res) => {
       dailyGoal: Number(user.daily_goal || 20),
       preferredTopics: topics.map((t) => t.topic_name),
       level: user.level,
-      theme: 'light', // Default theme, can be extended
-      notifications: true, // Default, can be extended
+      theme: user.theme || 'system',
+      notifications: Boolean(user.notifications_enabled ?? true),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -959,11 +1056,31 @@ app.get('/api/users/settings', authenticateToken, async (req, res) => {
 // Update user settings
 app.put('/api/users/settings', authenticateToken, async (req, res) => {
   try {
-    const { dailyGoal, preferredTopics } = req.body;
+    const { dailyGoal, preferredTopics, theme, notifications } = req.body;
     const userId = req.user.id;
 
+    const updates = [];
+    const values = [];
+
     if (dailyGoal !== undefined) {
-      await pool.query('UPDATE users SET daily_goal = ? WHERE id = ?', [Number(dailyGoal), userId]);
+      updates.push('daily_goal = ?');
+      values.push(Number(dailyGoal));
+    }
+    if (theme !== undefined) {
+      if (!['light', 'dark', 'system'].includes(theme)) {
+        return res.status(400).json({ message: 'Invalid theme value' });
+      }
+      updates.push('theme = ?');
+      values.push(theme);
+    }
+    if (notifications !== undefined) {
+      updates.push('notifications_enabled = ?');
+      values.push(Boolean(notifications));
+    }
+
+    if (updates.length > 0) {
+      values.push(userId);
+      await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, values);
     }
 
     if (preferredTopics && Array.isArray(preferredTopics)) {

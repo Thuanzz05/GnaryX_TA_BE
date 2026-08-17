@@ -17,6 +17,8 @@ CREATE TABLE users (
     level_number INT NOT NULL DEFAULT 1,
     streak INT NOT NULL DEFAULT 0,
     daily_goal INT NOT NULL DEFAULT 20,
+    theme ENUM('light','dark','system') NOT NULL DEFAULT 'system',
+    notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     last_login_at TIMESTAMP NULL, -- Theo dõi lần cuối đăng nhập
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
